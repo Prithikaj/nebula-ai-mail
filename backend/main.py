@@ -55,24 +55,37 @@ app = FastAPI(
 
 # ─── Middleware ───────────────────────────────────────────────────────────────
 
-# Session middleware (for OAuth state and user sessions)
-# Uses signed cookies - secret_key must be kept private
+# Determine if we are running in production (HTTPS) or locally (HTTP)
+IS_PRODUCTION = settings.environment == "production"
+
+# Session middleware.
+# Production: same_site="none" + https_only=True so the browser sends the
+#             cookie on cross-origin requests (Vercel → Render).
+# Development: same_site="lax" + https_only=False works over plain HTTP.
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.secret_key,
     session_cookie="nebula_session",
-    max_age=86400 * 7,  # 7 days
-    https_only=False,   # Set to True in production with HTTPS
-    same_site="lax",
+    max_age=86400 * 7,                       # 7 days
+    https_only=IS_PRODUCTION,                # True in prod (requires HTTPS)
+    same_site="none" if IS_PRODUCTION else "lax",
 )
 
-# CORS - allow frontend to call backend
+# CORS – allow both the configured frontend URL and localhost for local dev.
+# allow_credentials=True is required for the session cookie to be sent.
+allowed_origins = list({
+    settings.frontend_url,
+    "http://localhost:5173",
+    "http://localhost:3000",
+})
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url, "http://localhost:5173", "http://localhost:3000"],
-    allow_credentials=True,  # Required for session cookies
+    allow_origins=allowed_origins,
+    allow_credentials=True,                  # Must be True for cookies
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # ─── Routes ───────────────────────────────────────────────────────────────────

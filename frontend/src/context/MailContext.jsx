@@ -210,11 +210,41 @@ export function MailProvider({ children }) {
       const { data } = await authAPI.status()
       if (data.authenticated) {
         dispatch({ type: 'SET_USER', payload: data.user })
+        // Load inbox immediately after confirming authentication
+        // Use a local fetch here rather than calling loadInbox() to avoid
+        // the closure-stale-reference problem with useCallback dependencies.
+        try {
+          const inbox = await emailsAPI.inbox({ max_results: 20 })
+          dispatch({
+            type: 'SET_EMAIL_LIST',
+            emails: inbox.data.emails,
+            title: 'Inbox',
+            nextPageToken: inbox.data.next_page_token,
+          })
+        } catch {
+          // Inbox failure is non-fatal – user is still logged in
+        }
       } else {
         dispatch({ type: 'AUTH_CHECKED' })
       }
     } catch {
       dispatch({ type: 'AUTH_CHECKED' })
+    }
+  }, [])
+
+  /* ── Detect OAuth redirect and re-check auth ──
+     After Google OAuth the backend redirects to /?auth=success.
+     The page reloads, React mounts fresh, and checkAuth() runs above.
+     We additionally strip the query param from the URL so a manual
+     refresh doesn't re-trigger any stale logic.                        */
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('auth') === 'success') {
+      // Clean up the URL bar without a reload
+      window.history.replaceState({}, '', '/')
+    }
+    if (params.get('error')) {
+      window.history.replaceState({}, '', '/')
     }
   }, [])
 
@@ -233,28 +263,33 @@ export function MailProvider({ children }) {
     const wsUrl = `${base.replace(/^http/, 'ws')}/ws/mail?user_id=${userId}`
     const ws = new WebSocket(wsUrl)
     wsRef.current = ws
-    let wsAlive = false
-
-    ws.onopen = () => { wsAlive = true }
 
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data)
         if (msg.type === 'new_email') {
           dispatch({ type: 'PREPEND_EMAIL', email: msg.email })
-          // addToast defined below via closure — call after state settles
-          setTimeout(() => addToast(`New email from ${msg.email.sender_name}`, 'info'), 0)
+          dispatch({
+            type: 'ADD_TOAST',
+            toast: {
+              id: Date.now().toString(36),
+              message: `New email from ${msg.email.sender_name || 'someone'}`,
+              type: 'info',
+              duration: 4000,
+            },
+          })
         } else if (msg.type === 'email_updated') {
           dispatch({ type: 'UPDATE_EMAIL_IN_LIST', emailId: msg.email_id, updates: msg.updates })
         } else if (msg.type === 'inbox_refresh') {
-          loadInbox()
+          // Trigger a silent inbox reload
+          emailsAPI.inbox({ max_results: 20 }).then(({ data }) => {
+            dispatch({ type: 'SET_EMAIL_LIST', emails: data.emails, title: 'Inbox', nextPageToken: data.next_page_token })
+          }).catch(() => {})
         }
       } catch {}
     }
 
     ws.onclose = () => {
-      wsAlive = false
-      // Reconnect after 5 s
       setTimeout(() => connectWebSocket(userId), 5000)
     }
 
@@ -265,10 +300,7 @@ export function MailProvider({ children }) {
       if (ws.readyState === WebSocket.OPEN) ws.send('ping')
     }, 30000)
 
-    // ── Polling fallback ──────────────────────────────────────────────────
-    // Runs every 30 s. When Gmail push (Pub/Sub) is not configured the
-    // WebSocket will be connected but silent – polling ensures the inbox
-    // still refreshes automatically without any manual action.
+    // Polling fallback every 30 s — works even without Pub/Sub configured
     let lastKnownTopId = null
     const pollInterval = setInterval(async () => {
       try {
@@ -276,26 +308,25 @@ export function MailProvider({ children }) {
         const topId = data.emails?.[0]?.id
         if (topId && topId !== lastKnownTopId) {
           if (lastKnownTopId !== null) {
-            // A new email appeared at the top since last poll
-            const newEmails = data.emails.filter(
-              (e) => !lastKnownTopId || e.id > lastKnownTopId
-            )
-            newEmails.forEach((e) => {
-              dispatch({ type: 'PREPEND_EMAIL', email: e })
-            })
+            const newEmails = data.emails.filter((e) => e.id > lastKnownTopId)
+            newEmails.forEach((e) => dispatch({ type: 'PREPEND_EMAIL', email: e }))
             if (newEmails.length > 0) {
-              setTimeout(() => addToast(
-                `${newEmails.length} new email${newEmails.length > 1 ? 's' : ''} arrived`,
-                'info'
-              ), 0)
+              dispatch({
+                type: 'ADD_TOAST',
+                toast: {
+                  id: Date.now().toString(36),
+                  message: `${newEmails.length} new email${newEmails.length > 1 ? 's' : ''} arrived`,
+                  type: 'info',
+                  duration: 4000,
+                },
+              })
             }
           }
           lastKnownTopId = topId
         }
-      } catch { /* network error – ignore */ }
+      } catch {}
     }, 30000)
 
-    // Cleanup when component unmounts or user changes
     ws.addEventListener('close', () => {
       clearInterval(pingInterval)
       clearInterval(pollInterval)
