@@ -43,6 +43,9 @@ export const emailsAPI = {
   search:  (params)      => api.get('/emails/search', { params }),
   markRead:   (id)       => api.patch(`/emails/${id}/read`),
   markUnread: (id)       => api.patch(`/emails/${id}/unread`),
+  // Quota-efficient polling: IDs only (1 unit total), then fetch only new ones
+  pollIds:    ()         => api.get('/emails/poll-ids'),
+  fetchNew:   (ids)      => api.post('/emails/fetch-new', { ids }),
 }
 
 /* ── Assistant ── */

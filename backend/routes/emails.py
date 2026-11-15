@@ -49,6 +49,58 @@ class ForwardEmailRequest(BaseModel):
     body: Optional[str] = None
 
 
+# ─── Poll IDs only (used by 30-second frontend background poll) ──────────────
+
+@router.get("/poll-ids")
+async def poll_inbox_ids(
+    max_results: int = Query(20, ge=1, le=50),
+    user: User = Depends(get_current_user),
+):
+    """
+    Return only inbox message IDs — no bodies, no headers.
+    Cost: 1 quota unit total (single list call).
+    Frontend uses this to detect new arrivals and fetches metadata only
+    for IDs that aren't already in the email list.
+    """
+    try:
+        ids = await gmail_service.get_inbox_message_ids(
+            user=user,
+            max_results=max_results,
+        )
+        return JSONResponse({"ids": ids})
+    except Exception as e:
+        logger.error(f"Poll IDs error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Batch metadata fetch (for new IDs found during polling) ─────────────────
+
+@router.post("/fetch-new")
+async def fetch_new_emails(
+    request: dict,
+    user: User = Depends(get_current_user),
+):
+    """
+    Fetch metadata for a list of email IDs that the frontend
+    doesn't already have. Cost: 1 unit/message.
+    Body: {"ids": ["id1", "id2", ...]}
+    """
+    ids = request.get("ids", [])
+    if not ids:
+        return JSONResponse({"emails": []})
+    # Cap at 10 to prevent abuse
+    ids = ids[:10]
+    try:
+        emails = await gmail_service.get_emails_by_ids_metadata(
+            user=user,
+            email_ids=ids,
+        )
+        return JSONResponse({"emails": emails})
+    except Exception as e:
+        logger.error(f"Fetch new emails error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─── Inbox ────────────────────────────────────────────────────────────────────
 
 @router.get("/inbox")

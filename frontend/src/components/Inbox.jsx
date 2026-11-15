@@ -32,13 +32,20 @@ export default function Inbox() {
     emailList, emailListTitle, loadingEmails, emailListError,
     nextPageToken, currentView,
     loadInbox, loadSent,
+    inboxLoadedRef,   // skip self-load when checkAuth already loaded inbox
   } = useMail()
 
   const listRef = useRef(null)
 
-  // Load on mount / view change
+  // Load on mount / view change — but skip if checkAuth already populated the list
   useEffect(() => {
-    if (currentView === 'inbox') loadInbox()
+    if (currentView === 'inbox') {
+      if (!inboxLoadedRef.current) {
+        loadInbox()
+      }
+      // Reset flag so manual refresh or navigation works normally next time
+      inboxLoadedRef.current = false
+    }
     if (currentView === 'sent') loadSent()
   }, [currentView])
 

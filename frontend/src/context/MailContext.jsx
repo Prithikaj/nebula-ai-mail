@@ -1,66 +1,60 @@
 /**
  * MailContext – single source of truth for the entire application.
  *
- * The AI assistant dispatches "actions" (navigate, fill_compose, open_email, etc.)
- * that this context applies directly, making the UI update visibly.
+ * Quota-efficient polling strategy (30-second interval):
+ *   1. Poll /emails/poll-ids  → costs 1 unit total (no per-message charge)
+ *   2. Diff returned IDs against knownIdsRef (a Set of IDs already in the list)
+ *   3. Only call /emails/fetch-new for genuinely new IDs → 1 unit/message
+ *   4. Prepend new emails to the list and show a toast
+ *   5. Guard with pollInFlightRef so requests never overlap
  *
- * Shared state:
- *   currentView        – which main panel is shown
- *   emailList          – emails currently shown in the list
- *   currentEmail       – email open in detail view
- *   composeData        – form fields for compose/reply/forward
- *   activeFilters      – filters currently applied
- *   user               – authenticated user info
- *   loading / error    – loading/error states per section
- *   toasts             – notification toasts
+ * Duplicate-load prevention:
+ *   checkAuth() loads the inbox once and sets inboxLoadedRef = true.
+ *   Inbox.jsx skips its own useEffect load when inboxLoadedRef is already true.
+ *   inboxLoadedRef is exposed on the context value.
  */
 
-import React, {
+import {
   createContext, useContext, useReducer, useCallback, useEffect, useRef,
 } from 'react'
 import { emailsAPI, authAPI } from '../services/api'
 
-/* ─────────────────────── Initial State ─────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  Initial state                                                               */
+/* ─────────────────────────────────────────────────────────────────────────── */
 const initialState = {
-  /* Auth */
   user: null,
   authChecked: false,
 
-  /* Navigation */
-  currentView: 'inbox',          // inbox | sent | compose | email_detail | search | settings
+  currentView: 'inbox',   // inbox | sent | compose | email_detail | search | settings
 
-  /* Email list */
   emailList: [],
   emailListTitle: 'Inbox',
   nextPageToken: null,
   loadingEmails: false,
   emailListError: null,
 
-  /* Email detail */
   currentEmail: null,
   loadingEmail: false,
 
-  /* Compose */
   composeData: { to: '', cc: '', bcc: '', subject: '', body: '' },
-  composeMode: null,             // null | 'new' | 'reply' | 'forward'
+  composeMode: null,       // null | 'new' | 'reply' | 'forward'
   sendingEmail: false,
 
-  /* Filters */
   activeFilters: {},
 
-  /* Assistant */
   assistantOpen: true,
   assistantSessionId: null,
 
-  /* Toasts */
   toasts: [],
 }
 
-/* ─────────────────────── Reducer ───────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  Reducer                                                                     */
+/* ─────────────────────────────────────────────────────────────────────────── */
 function reducer(state, action) {
   switch (action.type) {
 
-    /* ── Auth ── */
     case 'SET_USER':
       return { ...state, user: action.payload, authChecked: true }
     case 'AUTH_CHECKED':
@@ -68,18 +62,14 @@ function reducer(state, action) {
     case 'LOGOUT':
       return { ...initialState, authChecked: true }
 
-    /* ── Navigation ── */
     case 'NAVIGATE':
       return {
         ...state,
         currentView: action.view,
-        // Clear compose when leaving compose
         ...(action.view !== 'compose' && action.view !== 'email_detail'
-          ? { currentEmail: null }
-          : {}),
+          ? { currentEmail: null } : {}),
       }
 
-    /* ── Email list ── */
     case 'SET_EMAIL_LIST':
       return {
         ...state,
@@ -98,16 +88,14 @@ function reducer(state, action) {
         loadingEmails: false,
       }
     case 'PREPEND_EMAIL':
-      return {
-        ...state,
-        emailList: [action.email, ...state.emailList],
-      }
+      // Skip if ID already in list (guards against races)
+      if (state.emailList.some((e) => e.id === action.email.id)) return state
+      return { ...state, emailList: [action.email, ...state.emailList] }
     case 'UPDATE_EMAIL_IN_LIST':
       return {
         ...state,
         emailList: state.emailList.map((e) =>
-          e.id === action.emailId ? { ...e, ...action.updates } : e
-        ),
+          e.id === action.emailId ? { ...e, ...action.updates } : e),
         currentEmail:
           state.currentEmail?.id === action.emailId
             ? { ...state.currentEmail, ...action.updates }
@@ -118,7 +106,6 @@ function reducer(state, action) {
     case 'EMAIL_LIST_ERROR':
       return { ...state, loadingEmails: false, emailListError: action.error }
 
-    /* ── Email detail ── */
     case 'SET_CURRENT_EMAIL':
       return { ...state, currentEmail: action.email, currentView: 'email_detail', loadingEmail: false }
     case 'LOADING_EMAIL':
@@ -126,7 +113,6 @@ function reducer(state, action) {
     case 'CLEAR_CURRENT_EMAIL':
       return { ...state, currentEmail: null }
 
-    /* ── Compose ── */
     case 'OPEN_COMPOSE':
       return {
         ...state,
@@ -146,19 +132,16 @@ function reducer(state, action) {
     case 'SENDING_EMAIL':
       return { ...state, sendingEmail: action.value }
 
-    /* ── Filters ── */
     case 'SET_FILTERS':
       return { ...state, activeFilters: action.filters }
     case 'CLEAR_FILTERS':
       return { ...state, activeFilters: {} }
 
-    /* ── Assistant ── */
     case 'TOGGLE_ASSISTANT':
       return { ...state, assistantOpen: !state.assistantOpen }
     case 'SET_ASSISTANT_SESSION':
       return { ...state, assistantSessionId: action.sessionId }
 
-    /* ── Toasts ── */
     case 'ADD_TOAST':
       return { ...state, toasts: [...state.toasts, action.toast] }
     case 'REMOVE_TOAST':
@@ -169,27 +152,33 @@ function reducer(state, action) {
   }
 }
 
-/* ─────────────────────── Context ───────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  Context                                                                     */
+/* ─────────────────────────────────────────────────────────────────────────── */
 const MailContext = createContext(null)
 
 export function MailProvider({ children }) {
   const [state, dispatch] = useReducer(reducer, initialState)
-  const wsRef = useRef(null)
-  const toastTimers = useRef({})
+
+  // Refs that survive re-renders without triggering them
+  const wsRef            = useRef(null)
+  const toastTimers      = useRef({})
+  const knownIdsRef      = useRef(new Set())   // IDs currently in the email list
+  const inboxLoadedRef   = useRef(false)        // prevents double load on mount
+  const pollInFlightRef  = useRef(false)        // prevents overlapping poll requests
+
+  /* ── Keep knownIdsRef in sync with the email list ── */
+  useEffect(() => {
+    knownIdsRef.current = new Set(state.emailList.map((e) => e.id))
+  }, [state.emailList])
 
   /* ── Auth check on mount ── */
-  useEffect(() => {
-    checkAuth()
-  }, [])
+  useEffect(() => { checkAuth() }, [])
 
-  /* ── WebSocket setup when user is authenticated ── */
+  /* ── WebSocket + polling when user authenticates ── */
   useEffect(() => {
-    if (state.user) {
-      connectWebSocket(state.user.id)
-    }
-    return () => {
-      if (wsRef.current) wsRef.current.close()
-    }
+    if (state.user) connectWebSocket(state.user.id)
+    return () => { if (wsRef.current) wsRef.current.close() }
   }, [state.user?.id])
 
   /* ── Toast auto-dismiss ── */
@@ -204,25 +193,40 @@ export function MailProvider({ children }) {
     })
   }, [state.toasts])
 
-  /* ─────────── Auth helpers ─────────────────────── */
+  /* ── Strip OAuth query params from URL bar on mount ── */
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('auth') === 'success' || params.get('error')) {
+      window.history.replaceState({}, '', '/')
+    }
+  }, [])
+
+  /* ─────────────────────────────────────────────────────────────────────── */
+  /*  Auth                                                                    */
+  /* ─────────────────────────────────────────────────────────────────────── */
   const checkAuth = useCallback(async () => {
     try {
       const { data } = await authAPI.status()
       if (data.authenticated) {
         dispatch({ type: 'SET_USER', payload: data.user })
-        // Load inbox immediately after confirming authentication
-        // Use a local fetch here rather than calling loadInbox() to avoid
-        // the closure-stale-reference problem with useCallback dependencies.
+        // Load inbox here — Inbox component checks inboxLoadedRef and skips
+        // its own effect-based load to avoid a duplicate API call.
+        inboxLoadedRef.current = false
         try {
-          const inbox = await emailsAPI.inbox({ max_results: 20 })
+          dispatch({ type: 'LOADING_EMAILS' })
+          const { data: inboxData } = await emailsAPI.inbox({ max_results: 20 })
           dispatch({
             type: 'SET_EMAIL_LIST',
-            emails: inbox.data.emails,
+            emails: inboxData.emails,
             title: 'Inbox',
-            nextPageToken: inbox.data.next_page_token,
+            nextPageToken: inboxData.next_page_token,
           })
+          // Seed knownIds so the first poll doesn't re-notify for existing mail
+          knownIdsRef.current = new Set(inboxData.emails.map((e) => e.id))
+          inboxLoadedRef.current = true
         } catch {
-          // Inbox failure is non-fatal – user is still logged in
+          inboxLoadedRef.current = false
+          // Inbox load failed — user is still authenticated, they can retry
         }
       } else {
         dispatch({ type: 'AUTH_CHECKED' })
@@ -232,56 +236,40 @@ export function MailProvider({ children }) {
     }
   }, [])
 
-  /* ── Detect OAuth redirect and re-check auth ──
-     After Google OAuth the backend redirects to /?auth=success.
-     The page reloads, React mounts fresh, and checkAuth() runs above.
-     We additionally strip the query param from the URL so a manual
-     refresh doesn't re-trigger any stale logic.                        */
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    if (params.get('auth') === 'success') {
-      // Clean up the URL bar without a reload
-      window.history.replaceState({}, '', '/')
-    }
-    if (params.get('error')) {
-      window.history.replaceState({}, '', '/')
-    }
-  }, [])
-
   const logout = useCallback(async () => {
-    try {
-      await authAPI.logout()
-    } finally {
+    try { await authAPI.logout() } finally {
+      inboxLoadedRef.current = false
+      knownIdsRef.current = new Set()
       dispatch({ type: 'LOGOUT' })
     }
   }, [])
 
-  /* ── WebSocket + polling fallback ───────────────── */
+  /* ─────────────────────────────────────────────────────────────────────── */
+  /*  WebSocket  +  30-second quota-efficient polling                         */
+  /* ─────────────────────────────────────────────────────────────────────── */
   const connectWebSocket = useCallback((userId) => {
     if (wsRef.current) wsRef.current.close()
-    const base = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+
+    const base  = import.meta.env.VITE_API_URL || 'http://localhost:8000'
     const wsUrl = `${base.replace(/^http/, 'ws')}/ws/mail?user_id=${userId}`
-    const ws = new WebSocket(wsUrl)
+    const ws    = new WebSocket(wsUrl)
     wsRef.current = ws
 
+    /* ── WebSocket messages (from Gmail push → Pub/Sub → backend) ── */
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data)
         if (msg.type === 'new_email') {
           dispatch({ type: 'PREPEND_EMAIL', email: msg.email })
-          dispatch({
-            type: 'ADD_TOAST',
-            toast: {
-              id: Date.now().toString(36),
-              message: `New email from ${msg.email.sender_name || 'someone'}`,
-              type: 'info',
-              duration: 4000,
-            },
-          })
+          dispatch({ type: 'ADD_TOAST', toast: {
+            id: `ws-${Date.now()}`,
+            message: `New email from ${msg.email.sender_name || 'someone'}`,
+            type: 'info', duration: 4000,
+          }})
         } else if (msg.type === 'email_updated') {
           dispatch({ type: 'UPDATE_EMAIL_IN_LIST', emailId: msg.email_id, updates: msg.updates })
         } else if (msg.type === 'inbox_refresh') {
-          // Trigger a silent inbox reload
+          // Full refresh requested by server
           emailsAPI.inbox({ max_results: 20 }).then(({ data }) => {
             dispatch({ type: 'SET_EMAIL_LIST', emails: data.emails, title: 'Inbox', nextPageToken: data.next_page_token })
           }).catch(() => {})
@@ -289,51 +277,84 @@ export function MailProvider({ children }) {
       } catch {}
     }
 
-    ws.onclose = () => {
-      setTimeout(() => connectWebSocket(userId), 5000)
-    }
-
+    ws.onclose = () => { setTimeout(() => connectWebSocket(userId), 5000) }
     ws.onerror = () => { ws.close() }
 
-    // Keep-alive ping every 30 s
+    /* ── Keep-alive ping ── */
     const pingInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) ws.send('ping')
     }, 30000)
 
-    // Polling fallback every 30 s — works even without Pub/Sub configured
-    let lastKnownTopId = null
+    /* ── 30-second quota-efficient background poll ──────────────────────
+     *
+     * Strategy (minimises Gmail API quota cost):
+     *
+     *  Step 1 — GET /emails/poll-ids
+     *           Calls Gmail messages.list()  → costs 1 unit TOTAL (no body)
+     *           Returns up to 20 message IDs from the inbox.
+     *
+     *  Step 2 — Diff against knownIdsRef
+     *           IDs already in the email list are skipped entirely.
+     *
+     *  Step 3 — POST /emails/fetch-new  (only if new IDs found)
+     *           Calls Gmail messages.get(format='metadata') per new ID
+     *           → costs 1 unit/message, capped at 10 per poll cycle.
+     *           Returns headers + snippet (enough for the inbox row).
+     *
+     *  Step 4 — Prepend new emails to the list, show a toast.
+     *
+     *  pollInFlightRef prevents overlapping requests if a cycle takes >30 s.
+     * ──────────────────────────────────────────────────────────────────── */
     const pollInterval = setInterval(async () => {
-      try {
-        const { data } = await emailsAPI.inbox({ max_results: 5 })
-        const topId = data.emails?.[0]?.id
-        if (topId && topId !== lastKnownTopId) {
-          if (lastKnownTopId !== null) {
-            const newEmails = data.emails.filter((e) => e.id > lastKnownTopId)
-            newEmails.forEach((e) => dispatch({ type: 'PREPEND_EMAIL', email: e }))
-            if (newEmails.length > 0) {
-              dispatch({
-                type: 'ADD_TOAST',
-                toast: {
-                  id: Date.now().toString(36),
-                  message: `${newEmails.length} new email${newEmails.length > 1 ? 's' : ''} arrived`,
-                  type: 'info',
-                  duration: 4000,
-                },
-              })
-            }
-          }
-          lastKnownTopId = topId
-        }
-      } catch {}
-    }, 30000)
+      // Skip if previous poll hasn't finished yet
+      if (pollInFlightRef.current) return
+      pollInFlightRef.current = true
 
+      try {
+        /* Step 1: fetch IDs only — 1 quota unit total */
+        const { data: pollData } = await emailsAPI.pollIds()
+        const latestIds = pollData.ids || []
+
+        /* Step 2: diff against what we already have */
+        const newIds = latestIds.filter((id) => !knownIdsRef.current.has(id))
+
+        if (newIds.length === 0) return  // nothing new — done
+
+        /* Step 3: fetch metadata only for new IDs (capped at 10) */
+        const { data: fetchData } = await emailsAPI.fetchNew(newIds.slice(0, 10))
+        const newEmails = fetchData.emails || []
+
+        if (newEmails.length === 0) return
+
+        /* Step 4: update UI */
+        newEmails.forEach((email) => {
+          dispatch({ type: 'PREPEND_EMAIL', email })
+        })
+
+        dispatch({ type: 'ADD_TOAST', toast: {
+          id: `poll-${Date.now()}`,
+          message: `${newEmails.length} new email${newEmails.length > 1 ? 's' : ''} arrived`,
+          type: 'info', duration: 4000,
+        }})
+
+      } catch {
+        // Network error or quota error — silently skip this cycle
+      } finally {
+        pollInFlightRef.current = false
+      }
+    }, 30000)  // 30-second interval
+
+    /* Cleanup both intervals when the WebSocket closes */
     ws.addEventListener('close', () => {
       clearInterval(pingInterval)
       clearInterval(pollInterval)
+      pollInFlightRef.current = false
     })
   }, [])
 
-  /* ─────────── Email loading ─────────────────────── */
+  /* ─────────────────────────────────────────────────────────────────────── */
+  /*  Email loading                                                            */
+  /* ─────────────────────────────────────────────────────────────────────── */
   const loadInbox = useCallback(async (pageToken = null) => {
     dispatch({ type: 'LOADING_EMAILS' })
     try {
@@ -342,6 +363,8 @@ export function MailProvider({ children }) {
         dispatch({ type: 'APPEND_EMAIL_LIST', emails: data.emails, nextPageToken: data.next_page_token })
       } else {
         dispatch({ type: 'SET_EMAIL_LIST', emails: data.emails, title: 'Inbox', nextPageToken: data.next_page_token })
+        knownIdsRef.current = new Set(data.emails.map((e) => e.id))
+        inboxLoadedRef.current = true
       }
     } catch (e) {
       dispatch({ type: 'EMAIL_LIST_ERROR', error: e.response?.data?.detail || 'Failed to load inbox' })
@@ -362,16 +385,18 @@ export function MailProvider({ children }) {
     }
   }, [])
 
+  /* Full body fetched only when the user opens an email (format='full', 5 units) */
   const openEmail = useCallback(async (emailId) => {
     dispatch({ type: 'LOADING_EMAIL' })
     try {
       const { data } = await emailsAPI.get(emailId)
       dispatch({ type: 'SET_CURRENT_EMAIL', email: data })
-      // Mark as read
       emailsAPI.markRead(emailId).catch(() => {})
       dispatch({ type: 'UPDATE_EMAIL_IN_LIST', emailId, updates: { is_unread: false } })
-    } catch (e) {
-      addToast('Could not open email', 'error')
+    } catch {
+      dispatch({ type: 'ADD_TOAST', toast: {
+        id: `err-${Date.now()}`, message: 'Could not open email', type: 'error', duration: 4000,
+      }})
     }
   }, [])
 
@@ -386,17 +411,15 @@ export function MailProvider({ children }) {
         filters: params,
       })
       dispatch({ type: 'NAVIGATE', view: 'search' })
-    } catch (e) {
+    } catch {
       dispatch({ type: 'EMAIL_LIST_ERROR', error: 'Search failed' })
     }
   }, [])
 
-  /* ─────────── AI Action Dispatcher ─────────────── */
-  /**
-   * applyAIActions – called after every assistant response.
-   * Takes the "actions" array from the backend and mutates React state
-   * so the UI updates visibly exactly as the AI intends.
-   */
+  /* ─────────────────────────────────────────────────────────────────────── */
+  /*  AI Action Dispatcher                                                    */
+  /*  Called after every assistant response — applies actions to React state  */
+  /* ─────────────────────────────────────────────────────────────────────── */
   const applyAIActions = useCallback(async (actions = [], extraData = {}) => {
     for (const action of actions) {
       switch (action.type) {
@@ -407,7 +430,7 @@ export function MailProvider({ children }) {
           } else {
             dispatch({ type: 'NAVIGATE', view: action.view })
             if (action.view === 'inbox') loadInbox()
-            if (action.view === 'sent') loadSent()
+            if (action.view === 'sent')  loadSent()
           }
           break
 
@@ -421,7 +444,11 @@ export function MailProvider({ children }) {
           break
 
         case 'open_compose':
-          dispatch({ type: 'OPEN_COMPOSE', data: action.compose_data || {}, mode: action.compose_data?.is_forward ? 'forward' : 'new' })
+          dispatch({
+            type: 'OPEN_COMPOSE',
+            data: action.compose_data || {},
+            mode: action.compose_data?.is_forward ? 'forward' : 'new',
+          })
           break
 
         case 'update_email_list':
@@ -457,7 +484,7 @@ export function MailProvider({ children }) {
           break
 
         case 'request_confirmation':
-          // The assistant text already asks for confirmation – no extra action needed
+          // Assistant text already asks — no extra UI action needed
           break
 
         default:
@@ -466,13 +493,16 @@ export function MailProvider({ children }) {
     }
   }, [loadInbox, loadSent, openEmail, state.currentView])
 
-  /* ─────────── Toast helper ─────────────────────── */
+  /* ─────────────────────────────────────────────────────────────────────── */
+  /*  Helpers                                                                 */
+  /* ─────────────────────────────────────────────────────────────────────── */
   const addToast = useCallback((message, type = 'info', duration = 4000) => {
-    const id = Date.now().toString(36) + Math.random().toString(36).slice(2)
-    dispatch({ type: 'ADD_TOAST', toast: { id, message, type, duration } })
+    dispatch({ type: 'ADD_TOAST', toast: {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2),
+      message, type, duration,
+    }})
   }, [])
 
-  /* ─────────── Send email ────────────────────────── */
   const sendEmail = useCallback(async (data) => {
     dispatch({ type: 'SENDING_EMAIL', value: true })
     try {
@@ -487,7 +517,9 @@ export function MailProvider({ children }) {
     }
   }, [loadSent, addToast])
 
-  /* ─────────── Context value ─────────────────────── */
+  /* ─────────────────────────────────────────────────────────────────────── */
+  /*  Context value                                                           */
+  /* ─────────────────────────────────────────────────────────────────────── */
   const value = {
     ...state,
     dispatch,
@@ -500,6 +532,8 @@ export function MailProvider({ children }) {
     sendEmail,
     applyAIActions,
     addToast,
+    // Exposed so Inbox.jsx can skip its own load when checkAuth already loaded
+    inboxLoadedRef,
   }
 
   return <MailContext.Provider value={value}>{children}</MailContext.Provider>
